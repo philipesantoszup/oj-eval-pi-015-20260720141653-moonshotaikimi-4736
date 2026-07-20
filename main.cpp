@@ -12,8 +12,8 @@ struct Entry {
     uint8_t key_len;
 };
 
-const int HASH_SIZE = 65536;  // 2^16
-const int KEY_POOL_SIZE = 1000000;  // 1 MB
+const int HASH_SIZE = 131072;  // 2^17
+const int KEY_POOL_SIZE = 1500000;  // 1.5 MB
 
 static Entry hash_table[HASH_SIZE];
 static char key_pool[KEY_POOL_SIZE];
