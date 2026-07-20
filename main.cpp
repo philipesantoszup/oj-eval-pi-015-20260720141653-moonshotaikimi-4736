@@ -1,8 +1,7 @@
 #include <bits/stdc++.h>
 using namespace std;
 
-// File Storage - minimal memory approach
-// Use C stdio instead of C++ streams for lower overhead
+// File Storage - robust solution with proper hash table
 
 #define META_FILE "meta.dat"
 #define DATA_FILE "data.dat"
@@ -39,10 +38,20 @@ static void appendMeta(const char* key, int len, int64_t pos) {
     fclose(fp);
 }
 
-// Ultra light hash: key -> position, with linear probing on collision
-// 65536 entries * 8 bytes = 512KB
-static int64_t htable[65536];
-static uint16_t hkey_len[65536]; // store key length for validation
+// Hash table with key storage
+// Each entry: position (8 bytes) + key hash + key length + key data offset
+struct HashEntry {
+    int64_t pos;        // -2 = empty
+    uint32_t key_hash;
+    uint16_t key_len;
+    uint32_t key_off;   // offset in key pool (in bytes)
+};
+
+const int HT_SIZE = 65536;
+static HashEntry ht[HT_SIZE];
+
+static char key_pool[2000000];  // ~2 MB
+static uint32_t kp_used = 0;
 
 static inline uint32_t khash(const char* k, int l) {
     uint32_t h = 5381;
@@ -50,13 +59,65 @@ static inline uint32_t khash(const char* k, int l) {
     return h;
 }
 
-static void h_init() {
-    for (int i = 0; i < 65536; i++) htable[i] = -2; // -2 = empty
+static void ht_init() {
+    for (int i = 0; i < HT_SIZE; i++) ht[i].pos = -2;
 }
 
-// Linear scan of meta file, populate hash table with latest entries
-static void h_load() {
-    h_init();
+static bool keys_equal(uint32_t off1, const char* k2, int l2) {
+    return memcmp(key_pool + off1, k2, l2) == 0;
+}
+
+static int64_t ht_get(const char* key, int len) {
+    uint32_t h = khash(key, len);
+    uint32_t idx = h & (HT_SIZE - 1);
+    
+    for (int probes = 0; probes < HT_SIZE; probes++) {
+        if (ht[idx].pos == -2) break;
+        if (ht[idx].key_hash == h && ht[idx].key_len == len) {
+            if (keys_equal(ht[idx].key_off, key, len)) {
+                return ht[idx].pos;
+            }
+        }
+        idx = (idx + 1) & (HT_SIZE - 1);
+    }
+    return -2;
+}
+
+static void ht_put(const char* key, int len, int64_t pos) {
+    uint32_t h = khash(key, len);
+    uint32_t idx = h & (HT_SIZE - 1);
+    
+    // Check if already exists
+    for (int probes = 0; probes < HT_SIZE; probes++) {
+        if (ht[idx].pos == -2) break;
+        if (ht[idx].key_hash == h && ht[idx].key_len == len) {
+            if (keys_equal(ht[idx].key_off, key, len)) {
+                ht[idx].pos = pos;
+                return;
+            }
+        }
+        idx = (idx + 1) & (HT_SIZE - 1);
+    }
+    
+    // Find empty slot
+    idx = h & (HT_SIZE - 1);
+    for (int probes = 0; probes < HT_SIZE; probes++) {
+        if (ht[idx].pos < -1) {
+            if (kp_used + len > 2000000) return;  // Pool full
+            memcpy(key_pool + kp_used, key, len);
+            ht[idx].pos = pos;
+            ht[idx].key_hash = h;
+            ht[idx].key_len = len;
+            ht[idx].key_off = kp_used;
+            kp_used += len + 1;  // +1 for null
+            return;
+        }
+        idx = (idx + 1) & (HT_SIZE - 1);
+    }
+}
+
+static void ht_load() {
+    ht_init();
     FILE* fp = fopen(META_FILE, "rb");
     if (!fp) return;
     
@@ -67,55 +128,12 @@ static void h_load() {
     while (fread(&len, 4, 1, fp) == 1 && len <= 64 && len >= 0) {
         if (len > 0 && fread(buf, 1, len, fp) != (size_t)len) break;
         if (fread(&pos, 8, 1, fp) != 1) break;
-        
-        if (len > 0) {
-            // Insert/replace in hash table
-            uint32_t h = khash(buf, len) & 65535;
-            for (int probes = 0; probes < 65536; probes++) {
-                uint32_t idx = (h + probes) & 65535;
-                if (htable[idx] < -1 || hkey_len[idx] == len) {
-                    // Check if same key
-                    if (htable[idx] >= -1) {
-                        // Check key match by re-scanning meta file for this slot
-                        // This is getting complex... simpler: always replace
-                    }
-                    htable[idx] = pos;
-                    hkey_len[idx] = len;
-                    break;
-                }
-            }
-        }
+        if (len > 0) ht_put(buf, len, pos);
     }
     fclose(fp);
 }
 
-static int64_t h_get(const char* key, int len) {
-    uint32_t h = khash(key, len) & 65535;
-    for (int probes = 0; probes < 65536; probes++) {
-        uint32_t idx = (h + probes) & 65535;
-        if (htable[idx] == -2) break; // Empty
-        if (htable[idx] >= -1 && hkey_len[idx] == len) {
-            // Key match assumed based on hash and length
-            // Need full key comparison - fall back to file scan
-            break;
-        }
-    }
-    return -2; // Not in hash
-}
-
-static void h_put(const char* key, int len, int64_t pos) {
-    uint32_t h = khash(key, len) & 65535;
-    for (int probes = 0; probes < 65536; probes++) {
-        uint32_t idx = (h + probes) & 65535;
-        if (htable[idx] < -1) {
-            htable[idx] = pos;
-            hkey_len[idx] = len;
-            return;
-        }
-    }
-}
-
-// Fallback: scan entire meta file for key
+// Fallback scan
 static int64_t scanMeta(const char* key, int len) {
     FILE* fp = fopen(META_FILE, "rb");
     if (!fp) return -1;
@@ -136,7 +154,7 @@ int main() {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
     
-    h_load();
+    ht_load();
     
     int n;
     cin >> n;
@@ -148,7 +166,7 @@ int main() {
         cin >> cmd >> index;
         int idxLen = strlen(index);
         
-        int64_t pos = h_get(index, idxLen);
+        int64_t pos = ht_get(index, idxLen);
         if (pos == -2) pos = scanMeta(index, idxLen);
         valCnt = (pos >= 0) ? loadValues(pos, values) : 0;
         
@@ -158,7 +176,7 @@ int main() {
                 values[0] = value; valCnt = 1;
                 int64_t newPos = saveValues(values, valCnt);
                 appendMeta(index, idxLen, newPos);
-                h_put(index, idxLen, newPos);
+                ht_put(index, idxLen, newPos);
             } else {
                 int lo = 0, hi = valCnt;
                 while (lo < hi) {
@@ -171,7 +189,7 @@ int main() {
                     values[lo] = value; valCnt++;
                     int64_t newPos = saveValues(values, valCnt);
                     appendMeta(index, idxLen, newPos);
-                    h_put(index, idxLen, newPos);
+                    ht_put(index, idxLen, newPos);
                 }
             }
         } else if (cmd[0] == 'd') {
@@ -188,7 +206,7 @@ int main() {
                     valCnt--;
                     int64_t newPos = valCnt > 0 ? saveValues(values, valCnt) : -1;
                     appendMeta(index, idxLen, newPos);
-                    h_put(index, idxLen, newPos);
+                    ht_put(index, idxLen, newPos);
                 }
             }
         } else {
