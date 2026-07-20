@@ -1,21 +1,19 @@
 #include <bits/stdc++.h>
 using namespace std;
 
-// Ultra-compact file-based key-value database
-// Fixed small hash table with linear probing
+// Memory-optimized: smaller hash table + file-based fallbacks
 
 const char* META_FILE = "meta.dat";
 const char* DATA_FILE = "data.dat";
 
-// Compact hash table entry
 struct Entry {
-    int64_t pos;      // -1 = empty, >=0 = position
-    uint32_t key_off; // offset in key pool
+    int64_t pos;       // -1 = empty
+    uint32_t key_off;  // offset in key pool (in 4-byte units)
     uint8_t key_len;
 };
 
-const int HASH_SIZE = 131072;  // 2^17 = 128K
-const int KEY_POOL_SIZE = 2000000;  // ~2 MB for keys
+const int HASH_SIZE = 65536;  // 2^16
+const int KEY_POOL_SIZE = 1000000;  // 1 MB
 
 static Entry hash_table[HASH_SIZE];
 static char key_pool[KEY_POOL_SIZE];
@@ -29,22 +27,48 @@ static inline uint32_t hashKey(const char* key, int len) {
     return h & (HASH_SIZE - 1);
 }
 
+// Scan meta file for key (fallback when not in hash table)
+static int64_t scanMetaFile(const char* key, int len) {
+    FILE* fp = fopen(META_FILE, "rb");
+    if (!fp) return -1;
+    
+    int64_t result = -1;
+    char buf[65];
+    int keylen;
+    int64_t pos;
+    
+    while (fread(&keylen, sizeof(int), 1, fp) == 1) {
+        if (keylen > 64 || keylen < 0) break;
+        if (keylen > 0 && (int)fread(buf, 1, keylen, fp) != keylen) break;
+        if (fread(&pos, sizeof(int64_t), 1, fp) != 1) break;
+        
+        if (keylen == len && memcmp(buf, key, len) == 0) {
+            result = pos;
+        }
+    }
+    
+    fclose(fp);
+    return result;
+}
+
 static int64_t findInIndex(const char* key, int len) {
     uint32_t h = hashKey(key, len);
     uint32_t idx = h;
     
     for (int probes = 0; probes < HASH_SIZE; probes++) {
         int64_t p = hash_table[idx].pos;
-        if (p < 0) return -1;  // Empty
+        if (p == -1) break;  // Empty - not found in cache
         if (hash_table[idx].key_len == len) {
-            const char* stored = key_pool + hash_table[idx].key_off;
+            const char* stored = key_pool + (hash_table[idx].key_off << 2);
             if (memcmp(stored, key, len) == 0) {
                 return p;
             }
         }
         idx = (idx + 1) & (HASH_SIZE - 1);
     }
-    return -1;
+    
+    // Not in hash table - scan file
+    return scanMetaFile(key, len);
 }
 
 static void updateIndex(const char* key, int len, int64_t pos) {
@@ -53,17 +77,23 @@ static void updateIndex(const char* key, int len, int64_t pos) {
     
     for (int probes = 0; probes < HASH_SIZE; probes++) {
         int64_t p = hash_table[idx].pos;
-        if (p < 0) {
-            // Empty slot
+        if (p == -1) {
+            // Empty slot - but check if we have room
+            if (key_pool_pos + len + 1 > KEY_POOL_SIZE) {
+                // No room in key pool, just return
+                return;
+            }
             hash_table[idx].pos = pos;
             hash_table[idx].key_len = len;
-            hash_table[idx].key_off = key_pool_pos;
+            hash_table[idx].key_off = key_pool_pos >> 2;
             memcpy(key_pool + key_pool_pos, key, len);
-            key_pool_pos += len + 1;
+            key_pool_pos += len + 4 - ((len + 4) % 4 ? (len + 4) % 4 : 4);
+            // Actually, simpler alignment
+            key_pool_pos = (key_pool_pos + len + 4) & ~3;
             return;
         }
         if (hash_table[idx].key_len == len) {
-            const char* stored = key_pool + hash_table[idx].key_off;
+            const char* stored = key_pool + (hash_table[idx].key_off << 2);
             if (memcmp(stored, key, len) == 0) {
                 hash_table[idx].pos = pos;
                 return;
@@ -149,7 +179,7 @@ int main() {
     char index[65];
     int value;
     int values[200];
-    int valCount = 0;
+    int valCount;
     
     for (int i = 0; i < n; ++i) {
         cin >> cmd >> index;
